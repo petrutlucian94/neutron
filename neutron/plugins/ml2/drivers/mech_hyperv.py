@@ -46,6 +46,10 @@ class HypervMechanismDriver(mech_agent.AgentMechanismDriverBase):
         if network_type == 'local':
             return True
         elif network_type in ['flat', 'vlan']:
-            return segment[api.PHYSICAL_NETWORK] in mappings
+            for pattern in mappings:
+                if match(pattern, segment[api.PHYSICAL_NETWORK]):
+                    return True
+            else:
+                return False
         else:
             return False
