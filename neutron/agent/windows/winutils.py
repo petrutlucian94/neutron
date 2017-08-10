@@ -20,6 +20,8 @@ import time
 import eventlet
 from eventlet import tpool
 from ovs import winutils as ovs_winutils
+from os_win import utilsfactory
+from os_win.utils.io import ioutils
 
 import win32con
 import win32event
@@ -103,15 +105,6 @@ class NamedPipe(object):
             This means that the named pipe handle is inherited when a new
             process is created.
         """
-        # For reading from the named pipe, we will use an overlapped structure
-        # for non-blocking I/O
-        self._read = ovs_winutils.pywintypes.OVERLAPPED()
-        # Create a new event which will be used by the overlapped structure
-        self._read.hEvent = ovs_winutils.get_new_event()
-        # This property tells if there is a pending reading operation on
-        # the named pipe or not.
-        self._read_pending = False
-
         if pipe_name is None:
             # Generate a random name for the named pipe if the name was not
             # passed explicitly as parameter.
@@ -125,43 +118,50 @@ class NamedPipe(object):
         # be accessed later on.
         self.namedpipe = ovs_winutils.create_named_pipe(self.name,
                                                         saAttr=sec_attributes)
-        # This property should be initialised explicitly later on by calling
-        # the method create_file of this class.
-        self._npipe_file = None
 
         if not self.namedpipe:
             # If there was an error when creating the named pipe, the property
             # "namedpipe" should be None. We raise an exception in this case
             raise NamedPipeException("Failed to create named pipe.")
 
-    @property
-    def read_overlapped_event(self):
-        """Return the event used by the overlapped structure for reading.
+        conn_evt = eventlet.patcher.original('threading').Event()
+        conn_evt.set()
+        self._input_queue = ioutils.IOQueue(conn_evt)
+        self._output_queue = ioutils.IOQueue(conn_evt)
 
-        This is the handle(event) on which we should wait if we want to be
-        notified when there is something to read from the named pipe.
-        """
-        return self._read.hEvent
+        self._handler = utilsfactory.get_named_pipe_handler(
+            pipe_handle=self.namedpipe.handle,
+            input_queue=self._input_queue,
+            output_queue=self._output_queue,
+            connect_event=conn_evt)
 
-    def _wait_event(self, event, timeout=win32event.INFINITE):
-        """Wait until the event is signaled or the timeout has passed."""
-        # If greenthreads are used, we need to wrap the call to
-        # win32event.WaitForMultipleObjects using avoid_blocking_call to make
-        # sure the function will not block the other greenthreads.
-        avoid_blocking_call(win32event.WaitForMultipleObjects,
-                            [event],
-                            False,
-                            timeout)
+    def connect(self):
+        ovs_winutils.connect_named_pipe(self.namedpipe)
+        self._handler.start()
 
-    def wait_for_read(self, timeout=win32event.INFINITE):
+    def wait(self, timeout=win32event.INFINITE):
         """Wait until there is something to read from the named pipe or the
 
         timeout passed as parameter has passed.
 
         :param timeout: int representing the timeout in milliseconds
         """
-        if self._read_pending:
-            self._wait_event(self._read.hEvent, timeout)
+        avoid_blocking_call(self._handler._stopped.wait)
+
+    def write(self, data, blocking=False):
+        if blocking:
+            avoid_blocking_call(self._handler.blocking_write, data)
+        else:
+            avoid_blocking_call(self._input_queue.put, data)
+
+    def _read(self):
+        data = ''
+        while not self._output_queue.empty():
+            data += self._output_queue.get()
+        return data
+
+    def read(self):
+        return avoid_blocking_call(self._read)
 
     def create_file(self, sec_attributes=-1):
         """Create the file for the named pipe and store it in the '_npipe_file'
@@ -190,159 +190,6 @@ class NamedPipe(object):
             raise NamedPipeException("Could not create file for named pipe. "
                                      "Error: %s." % e.strerror, e.winerror)
 
-    def blocking_write(self, buf, to_namedpipe=True):
-        """Write to the named pipe handle or the file handle.
-
-        This function will wait until the write operation has completed.
-
-        :param buf: string representing the buffer which will be written
-        :param to_namedpipe: boolean representing where to write the buffer
-            True = the buffer 'buf' will be written to the named pipe handle
-            False = the buffer 'buf' will be written to the file handle
-        """
-        if not to_namedpipe and self._npipe_file is None:
-            # If the method tries to write to the file handle but the
-            # property '_npipe_file' does not contain the file handle then
-            # we raise an exception
-            raise NamedPipeException("create_file must be called first.")
-        # Represents the handle where we should write the buffer
-        handle_to_write = self.namedpipe if to_namedpipe else self._npipe_file
-        # encoded_buf will contain the buffer 'buf' represented in binary type
-        encoded_buf = ovs_winutils.get_encoded_buffer(buf)
-
-        # If greenthreads are used, we need to wrap the call to
-        # ovs_winutils.write_file using avoid_blocking_call to make
-        # sure the function will not block the other greenthreads.
-        (errCode, _nBytesWritten) = avoid_blocking_call(
-            ovs_winutils.write_file,
-            handle_to_write,
-            encoded_buf,
-            None)
-        if errCode:
-            # errCode should be 0 if the operation completed successfully.
-            # If we reach here it means there was an error during the write
-            # operation and we should raise an exception
-            raise NamedPipeException("Could not write to named pipe.", errCode)
-
-    def nonblocking_read(self, bytes_to_read, from_namedpipe=True):
-        """Read from the named pipe handle or the file handle.
-
-        This function returns imediatly and does not wait for the read
-        operation to complete. In case the read operation is not complete,
-        the property '_read_pending' will be set to True and the method
-        get_read_result should be called to retrieve the result. Otherwise,
-        the output of the read operation is returned.
-
-        :param bytes_to_read: int representing the maximum number of bytes
-            to be read.
-        :param from_namedpipe: boolean representing from where to read
-            True = the function reads from the named pipe handle
-            False = he function reads from the file handle
-        """
-        if self._read_pending:
-            # If there is a pending read operation, the method
-            # 'get_read_result' should be called to retrieve the result.
-            return
-
-        # Represents the handle from where we should read.
-        handle_to_read = self.namedpipe if from_namedpipe else self._npipe_file
-
-        # The read operation is non-blocking because the read overlapped
-        # structure is passed. It will return immediately.
-        (errCode, self._read_buffer) = ovs_winutils.read_file(
-            handle_to_read,
-            bytes_to_read,
-            self._read)
-
-        if errCode:
-            # The error code should be 0 if the operation executed with success
-            if errCode == ovs_winutils.winerror.ERROR_IO_PENDING:
-                # This is returned when the overlapped structure is passed
-                # to the read operation (which is our case) and the operation
-                # has not finished yet. We mark this as a pending read
-                # operation and we will use the method 'get_read_result'
-                # later on to retrieve the result.
-                self._read_pending = True
-            else:
-                # In this case we received an unexpected error code, raise
-                # an exception.
-                raise NamedPipeException(
-                    "Could not read from named pipe.", errCode)
-            return None
-
-        # If we can not retrieve the output from the overlapped result,
-        # it means that the pipe was disconnected so we have no output.
-        # The returned value should be an empty string.
-        output = ""
-        try:
-            # Try to retrieve the result from the overlapped structure.
-            # This call should succeed or otherwise will raise an exception,
-            # but it will not block.
-            nBytesRead = ovs_winutils.get_overlapped_result(
-                handle_to_read,
-                self._read,
-                False)
-            # Mark the read operation as complete
-            self._read_pending = False
-            # Retrieve the result and put the decoded result inside the
-            # 'output' variable.
-            output = ovs_winutils.get_decoded_buffer(
-                self._read_buffer[:nBytesRead])
-            # We need to manually signal the event to make sure the call to
-            # wait for the event will not block.
-            win32event.SetEvent(self._read.hEvent)
-        except NamedPipeException as e:
-            # If the pipe was disconnected, it means no output, we will return
-            # an empty string in this case. Otherwise raise an exception.
-            if e.code not in ovs_winutils.pipe_disconnected_errors:
-                raise e
-        return output
-
-    def get_read_result(self, from_namedpipe=True):
-        """Return the result from the overlapped structure.
-
-        If there is no pending read operation, this function will return
-        immediately. This call will return False if the reading operation
-        has not completed yet and the read operation is still in progress.
-        Otherwise, it will return the result.
-
-        :param from_namedpipe: boolean representing from where to read
-            True = the function reads from the named pipe handle
-            False = he function reads from the file handle
-        """
-        if not self._read_pending:
-            # There is no pending read operation, we should return here
-            return
-
-        # Represents the handle from where we should read.
-        handle_to_read = self.namedpipe if from_namedpipe else self._npipe_file
-        try:
-            # Try to retrieve the result from the overlapped structure.
-            # This will raise an ERROR_IO_INCOMPLETE exception if the
-            # read operation has not completed yet.
-            nBytesRead = ovs_winutils.get_overlapped_result(handle_to_read,
-                                                            self._read,
-                                                            False)
-            # Mark the read operation as complete
-            self._read_pending = False
-            # Decode the result and return it
-            return ovs_winutils.get_decoded_buffer(
-                self._read_buffer[:nBytesRead])
-        except ovs_winutils.pywintypes.error as e:
-            if e.winerror == ovs_winutils.winerror.ERROR_IO_INCOMPLETE:
-                # In this case we should call again this function to try to
-                # retrieve the result.
-                self._read_pending = True
-                # Return False to mark that the read operation has not
-                # completed yet.
-                return False
-            else:
-                # If we reach here it means that an unexpected error was
-                # received. We should raise an exception in this case.
-                raise NamedPipeException(
-                    "Could not get the overlapped result. "
-                    "Error: '%s'" % e.strerror, e.winerror)
-
     def close_filehandle(self):
         """Close the file handle."""
         ovs_winutils.close_handle(self._npipe_file)
@@ -355,8 +202,6 @@ class NamedPipe(object):
         """Close all the handles used by this class."""
         if hasattr(self, "namedpipe") and self.namedpipe:
             ovs_winutils.close_handle(self.namedpipe)
-        if hasattr(self, "_read") and self._read.hEvent:
-            ovs_winutils.close_handle(self._read.hEvent)
         if hasattr(self, "_npipe_file") and self._npipe_file:
             ovs_winutils.close_handle(self._npipe_file)
 
@@ -465,28 +310,6 @@ class ProcessWithNamedPipes(object):
         self.stdin = ProcessWithNamedPipes.HandleClass(_pipe_stdin)
         _pipe_stdin = None
 
-    def _get_result_namedpipe(self, namedpipe):
-        """Retrieve the result from the named pipe given as parameter.
-
-        This function will return False if the read operation has not
-        completed yet and we should call this method again to try to retrieve
-        the result.
-
-        :param namedpipe: represents the NamedPipe object from where to
-            retrieve the result
-        """
-        # The default returned value will be empty string. This is returned
-        # in case the pipe was disconnected.
-        output = ""
-        try:
-            output = namedpipe.get_read_result()
-        except NamedPipeException as e:
-            # If the pipe was disconnected the error is ignored, otherwise
-            # we raise an exception
-            if e.code not in ovs_winutils.pipe_disconnected_errors:
-                raise e
-        return output
-
     def communicate(self, input=None):
         """Return stdout and stderr of the child process.
 
@@ -498,33 +321,24 @@ class ProcessWithNamedPipes(object):
             to the child process. If this value is None, then nothing is passed
             as stdin for the child process.
         """
+
+        self.stdin.namedpipe.connect()
+        self._pipe_stdout.connect()
+        self._pipe_stderr.connect()
+
         if input:
             # If we received any input, write it to stdin then close the handle
             # to send EOF on stdin to the child process
-            self._stdin_write(input)
+            self._stdin_write(input, blocking=True)
             self.stdin.close()
-
-        # Try to retrieve the output for stdout and stderr. If the read
-        # operation has not completed yet, then None will be returned and
-        # we will try to retrieve the result again after the process is
-        # terminated.
-        stdout = self._pipe_stdout.nonblocking_read(self._BUFSIZE)
-        stderr = self._pipe_stderr.nonblocking_read(self._BUFSIZE)
 
         # Wait for the process to terminate
         self.wait()
+        self._pipe_stdout.wait()
+        self._pipe_stderr.wait()
 
-        if stdout is None:
-            # Wait until the read operation for stdout has completed and
-            # then retrieve the result.
-            self._pipe_stdout.wait_for_read()
-            stdout = self._get_result_namedpipe(self._pipe_stdout)
-
-        if stderr is None:
-            # Wait until the read operation for stdout has completed and
-            # then retrieve the result.
-            self._pipe_stderr.wait_for_read()
-            stderr = self._get_result_namedpipe(self._pipe_stderr)
+        stdout = self._pipe_stdout.read()
+        stderr = self._pipe_stderr.read()
 
         # Close all the handles since the child process is terminated
         # at this point.
@@ -537,11 +351,11 @@ class ProcessWithNamedPipes(object):
         # with the subprocess module.
         return (stdout, stderr)
 
-    def _stdin_write(self, input):
+    def _stdin_write(self, input, blocking=False):
         """Send input to stdin for the child process."""
         if input:
             encoded_buf = ovs_winutils.get_encoded_buffer(input)
-            self.stdin.namedpipe.blocking_write(encoded_buf)
+            self.stdin.namedpipe.write(encoded_buf, blocking=blocking)
 
     def _start_process(self, cmd_line, env):
         """Create a process with the command line 'cmd_line' and environment
