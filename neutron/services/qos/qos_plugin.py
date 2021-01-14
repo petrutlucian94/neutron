@@ -103,6 +103,7 @@ class QoSPlugin(qos.QoSPluginBase):
             return port_res
 
         if port_res.get('bulk'):
+            # Make sure not to leak this data, which is used internally.
             port_res['resource_request'] = {
                 'qos_id': qos_id,
                 'network_id': port_db.network_id,
@@ -170,7 +171,14 @@ class QoSPlugin(qos.QoSPluginBase):
         for port_res in ports_res:
             if port_res.get('resource_request') is None:
                 continue
+
+            # Clear the internal resource request data. We might consider
+            # using a separate field to avoid propagating it to Nova
+            # by mistake.
             qos_id = port_res['resource_request'].pop('qos_id', None)
+            vnic_type = port_res['resource_request'].pop('vnic_type')
+            net_id = port_res['resource_request'].pop('network_id')
+
             if not qos_id:
                 continue
 
@@ -183,7 +191,6 @@ class QoSPlugin(qos.QoSPluginBase):
             if not resources:
                 continue
 
-            net_id = port_res['resource_request'].pop('network_id')
             if net_id not in net_segments:
                 segments = network_object.NetworkSegment.get_objects(
                     context.get_admin_context(),
@@ -191,7 +198,7 @@ class QoSPlugin(qos.QoSPluginBase):
                 net_segments[net_id] = segments
 
             traits = QoSPlugin._get_traits(
-                port_res['resource_request'].pop('vnic_type'),
+                vnic_type,
                 net_segments[net_id])
             if not traits:
                 continue
