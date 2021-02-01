@@ -29,6 +29,7 @@ from neutron_lib import exceptions as n_exc
 from neutron_lib.objects import exceptions as obj_exc
 from neutron_lib.utils import helpers
 from neutron_lib.utils import net
+from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import uuidutils
 import six
@@ -36,6 +37,7 @@ from sqlalchemy.orm import scoped_session
 
 from neutron._i18n import _
 from neutron.common import _constants as const
+from neutron.conf.db import securitygroups_db as sg_db
 from neutron.db.models import securitygroup as sg_models
 from neutron.db import rbac_db_mixin as rbac_mixin
 from neutron.extensions import securitygroup as ext_sg
@@ -48,6 +50,8 @@ from neutron import quota
 LOG = logging.getLogger(__name__)
 
 DEFAULT_SG_DESCRIPTION = _('Default security group')
+
+sg_db.register_db_sg_opts()
 
 
 @resource_extend.has_resource_extenders
@@ -123,7 +127,7 @@ class SecurityGroupDbMixin(ext_sg.SecurityGroupPluginBase,
                 self)
 
             for ethertype in ext_sg.sg_supported_ethertypes:
-                if default_sg:
+                if default_sg and cfg.CONF.default_sg_remote_rule:
                     # Allow intercommunication
                     ingress_rule = sg_obj.SecurityGroupRule(
                         context, id=uuidutils.generate_uuid(),
